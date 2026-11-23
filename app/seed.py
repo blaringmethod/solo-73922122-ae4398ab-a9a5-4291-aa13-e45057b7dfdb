@@ -38,7 +38,61 @@ DEMO = [
         "period": ("2026-01-01", "2026-07-01"),
         "publish_seed_version": True,
     },
+    {
+        "title": "星光渡口（供数换版演示）",
+        "declarations": [
+            ("D301", "2026-01-01", "2026-07-01", {"丁": 7000, "戊": 3000}),
+        ],
+        "period": ("2026-01-01", "2026-07-01"),
+        "publish_seed_version": False,
+    },
 ]
+
+
+def _seg(start: str, end: str, shares: dict) -> dict:
+    return {"start_date": start, "end_date": end, "ok": True,
+            "reason": None, "shares": shares}
+
+
+def seed_supply_demo(recording_id: int) -> None:
+    """供数换版演示：半年核定版 + 三月单月核定版，并预置首个供数批号。"""
+    signature = "seed-supply-demo"
+    # v1：覆盖整个上半年的季度核定版（两段份额）
+    v1_payload = {
+        "feasible": True,
+        "retain": ["D301"],
+        "returned": [],
+        "segments": [
+            _seg("2026-01-01", "2026-04-01", {"丁": 7000, "戊": 3000}),
+            _seg("2026-04-01", "2026-07-01", {"丁": 7500, "戊": 2500}),
+        ],
+        "checked_order_count": 1,
+        "reason": None,
+    }
+    v1_id = db.publish_version(
+        recording_id, "2026-01-01", "2026-07-01", v1_payload, signature
+    )
+    # v2：只覆盖三月的单月核定版（入仓时只换一个月份额的场景）
+    v2_payload = {
+        "feasible": True,
+        "retain": ["D301"],
+        "returned": [],
+        "segments": [_seg("2026-03-01", "2026-04-01", {"丁": 6000, "戊": 4000})],
+        "checked_order_count": 1,
+        "reason": None,
+    }
+    db.publish_version(
+        recording_id, "2026-03-01", "2026-04-01", v2_payload, signature
+    )
+
+    # 预置批号 B0001：上半年整段先取 v1，随后入仓员可把三月切到 v2
+    from .web import _current_snapshot_builder
+
+    v1 = db.get_version(v1_id)
+    db.perform_switch(
+        recording_id, v1, "2026-01-01", "2026-07-01",
+        _current_snapshot_builder(recording_id),
+    )
 
 
 def seed_demo_data() -> None:
@@ -82,3 +136,6 @@ def seed_demo_data() -> None:
                     "reason": None,
                 }
             db.publish_version(recording_id, start, end, payload, signature)
+
+        if item["title"].startswith("星光渡口"):
+            seed_supply_demo(recording_id)

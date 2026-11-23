@@ -7,6 +7,7 @@
 <div class="actions">
   <a class="button" href="{{ url_for('web.declaration_new', recording_id=recording.id) }}">按单号录入申报</a>
   <a class="button" href="{{ url_for('web.preview_new', recording_id=recording.id) }}">预览核定（选结算期）</a>
+  <a class="button secondary" href="{{ url_for('web.supply_switch', recording_id=recording.id) }}">供数换版 / 查数</a>
 </div>
 
 <h3>申报台账（共 {{ declarations|length }}/12 单，更正后旧版留档）</h3>

@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}查现行供数 · {{ recording.title }}{% endblock %}
+{% block content %}
+<p><a href="{{ url_for('web.supply_switch', recording_id=recording.id) }}">&larr; 返回 {{ recording.title }} 供数换版</a></p>
+<h2>按日期段查现行供数 · {{ recording.title }}</h2>
+<p class="muted">现行供数直接读取物化来源段，不重放换版历史；
+  未指定来源的日期标为缺档。区间含起日、不含止日。</p>
+
+<form method="get" action="{{ url_for('web.supply_current', recording_id=recording.id) }}" class="inline-form">
+  <label>起日（含） <input type="date" name="start_date" value="{{ start_raw }}" required></label>
+  <label>止日（不含） <input type="date" name="end_date" value="{{ end_raw }}" required></label>
+  <button type="submit">查询</button>
+  {% if latest %}<span class="muted">现行批号：<strong>{{ latest.batch_no }}</strong></span>{% endif %}
+</form>
+{% if period_error %}<div class="flash error">{{ period_error }}</div>{% endif %}
+
+{% if queried and not period_error %}
+<h3>查询结果</h3>
+<table>
+  <thead>
+    <tr><th>段起日(含)</th><th>段止日(不含)</th><th>本次批号</th><th>各段份额（万分比）</th><th>来源核定版</th><th>状态</th></tr>
+  </thead>
+  <tbody>
+  {% for r in rows %}
+    <tr>
+      <td>{{ r.start_date }}</td><td>{{ r.end_date }}</td>
+      <td>{{ latest.batch_no if latest else '—' }}</td>
+      <td>
+        {% if r.shares %}{% for name, value in r.shares.items() %}<span class="chip">{{ name }}：{{ value }}</span>{% endfor %}
+        {% else %}<span class="muted">无份额</span>{% endif %}
+      </td>
+      <td>{% if r.source_version_id %}{{ version_label(versions_by_id.get(r.source_version_id)) }}{% else %}—{% endif %}</td>
+      <td>
+        {% if r.missing %}<span class="bad">缺档</span>
+          <div class="muted">{{ r.reason }}</div>
+        {% else %}<span class="ok">可供数</span>{% endif %}
+      </td>
+    </tr>
+  {% else %}
+    <tr><td colspan="6" class="muted">查询区间为空。</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p><a class="button secondary"
+   href="{{ url_for('web.supply_current_api', recording_id=recording.id, start_date=start_raw, end_date=end_raw) }}">
+   查看本次查询 JSON</a></p>
+{% endif %}
+{% endblock %}

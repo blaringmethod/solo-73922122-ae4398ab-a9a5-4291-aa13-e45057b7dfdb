@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}供数换版{% endblock %}
+{% block content %}
+<h2>供数换版</h2>
+<p>入仓员按录音选择已发布核定版与该版覆盖内的日期段（含起日、不含止日）换版。
+每次换版成功生成一个供数批号；批号快照固化，旧批复查按原样取数，不随后续换版改变。</p>
+<table>
+  <thead>
+    <tr><th>录音</th><th>现行批号</th><th>换版次数</th><th>操作</th></tr>
+  </thead>
+  <tbody>
+  {% for r in recordings %}
+    {% set b = latest.get(r.id) %}
+    <tr>
+      <td>{{ r.title }}</td>
+      <td>{% if b %}<strong>{{ b.batch_no }}</strong>
+        <span class="muted">（{{ b.created_at }}）</span>{% else %}
+        <span class="muted">尚未产生供数批号</span>{% endif %}</td>
+      <td>{{ b.id if b else 0 }}</td>
+      <td>
+        <a href="{{ url_for('web.supply_switch', recording_id=r.id) }}">换版 / 现行供数</a> ·
+        <a href="{{ url_for('web.supply_current', recording_id=r.id) }}">按日期段查数</a>
+      </td>
+    </tr>
+  {% else %}
+    <tr><td colspan="4" class="muted">暂无录音。</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

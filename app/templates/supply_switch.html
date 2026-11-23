@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+{% block title %}供数换版 · {{ recording.title }}{% endblock %}
+{% block content %}
+<p><a href="{{ url_for('web.supply_index') }}">&larr; 返回供数换版</a> ·
+   <a href="{{ url_for('web.recording_detail', recording_id=recording.id) }}">录音台账</a></p>
+<h2>供数换版 · {{ recording.title }}</h2>
+
+<div class="card">
+  <h3>发起换版</h3>
+  {% if versions %}
+  <form method="post" action="{{ url_for('web.supply_switch', recording_id=recording.id) }}">
+    <label>来源核定版（仅可换为该录音已发布的核定版）
+      <select name="version_id" required>
+        {% for v in versions %}
+        <option value="{{ v.id }}">v{{ v.version_no }} ·
+          {{ v.period_start }}（含） ~ {{ v.period_end }}（不含） · 发布于 {{ v.created_at }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <div class="row">
+      <label>换版段起日（含） <input type="date" name="switch_start" required></label>
+      <label>换版段止日（不含） <input type="date" name="switch_end" required></label>
+    </div>
+    <p class="muted">换版只改变所选日期的来源；切到原供数段中间时，区间两侧沿用原版。
+       日期段必须完全落在所选核定版覆盖范围内。</p>
+    <label class="check"><input type="checkbox" name="simulate_fail" value="1">
+      模拟写入失败（演示失败回滚：沿用原批号与原份额）</label>
+    <div class="actions"><button type="submit">执行换版并生成批号</button></div>
+  </form>
+  {% else %}
+  <p class="bad">该录音尚无已发布核定版，请先在“预览核定”中发布核定版后再换版。</p>
+  {% endif %}
+</div>
+
+<div class="actions">
+  <a class="button secondary" href="{{ url_for('web.supply_current', recording_id=recording.id) }}">按日期段查现行供数</a>
+</div>
+
+<h3>现行供数来源段（物化口径，查份额无需重放换版历史）</h3>
+{% if assignments %}
+<table>
+  <thead>
+    <tr><th>段起日(含)</th><th>段止日(不含)</th><th>来源核定版</th><th>最后写入批号</th></tr>
+  </thead>
+  <tbody>
+  {% for a in assignments %}
+    <tr>
+      <td>{{ a.start_date }}</td>
+      <td>{{ a.end_date }}</td>
+      <td>{{ version_label(versions_by_id.get(a.source_version_id)) }}</td>
+      <td>
+        {% set bb = batches | selectattr('id', 'equalto', a.updated_batch_id) | list %}
+        {{ bb[0].batch_no if bb else a.updated_batch_id }}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+<h4>现行份额视图（来源段外包区间 {{ domain[0] }} ~ {{ domain[1] }}，按核定版分段细化）</h4>
+<table>
+  <thead>
+    <tr><th>段起日(含)</th><th>段止日(不含)</th><th>份额（万分比）</th><th>来源核定版</th><th>状态</th></tr>
+  </thead>
+  <tbody>
+  {% for r in current_rows %}
+    <tr>
+      <td>{{ r.start_date }}</td><td>{{ r.end_date }}</td>
+      <td>{% for name, value in r.shares.items() %}<span class="chip">{{ name }}：{{ value }}</span>{% endfor %}</td>
+      <td>{% if r.source_version_id %}{{ version_label(versions_by_id.get(r.source_version_id)) }}{% else %}—{% endif %}</td>
+      <td>{% if r.missing %}<span class="bad">缺档</span>{% else %}<span class="ok">可供数</span>{% endif %}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">尚无任何供数来源；首次换版后生成批号与来源段。未指定来源的日期查数时标为缺档。</p>
+{% endif %}
+
+<h3>供数批号档案（旧批按原样复查）</h3>
+<table>
+  <thead>
+    <tr><th>批号</th><th>换版日期段</th><th>切至核定版</th><th>生成时间</th><th>操作</th></tr>
+  </thead>
+  <tbody>
+  {% for b in batches | reverse %}
+    <tr>
+      <td><strong>{{ b.batch_no }}</strong></td>
+      <td>{{ b.switch_start }} ~ {{ b.switch_end }}</td>
+      <td>{{ version_label(versions_by_id.get(b.target_version_id)) }}</td>
+      <td>{{ b.created_at }}</td>
+      <td>
+        <a href="{{ url_for('web.supply_batch_show', batch_id=b.id) }}">复查结果</a> ·
+        <a href="{{ url_for('web.supply_batch_api', batch_id=b.id) }}">JSON</a>
+      </td>
+    </tr>
+  {% else %}
+    <tr><td colspan="5" class="muted">暂无批号。</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

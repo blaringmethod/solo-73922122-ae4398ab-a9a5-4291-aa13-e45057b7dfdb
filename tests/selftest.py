@@ -7,11 +7,13 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import create_app, db  # noqa: E402
 from app.engine import evaluate_segment, solve, split_segments  # noqa: E402
+from app.supply import build_effective_view, merge_adjacent, replace_interval  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -257,8 +259,242 @@ def test_web() -> None:
     check("核定版列表页 200", resp.status_code == 200 and "清晨钟声" in resp.text)
 
 
+# ---------------- 供数换版：纯函数 ----------------
+
+def test_supply_engine() -> None:
+    print("== 供数换版纯函数 ==")
+
+    def a(start, end, vid, batch=1):
+        return {"start_date": start, "end_date": end,
+                "source_version_id": vid, "updated_batch_id": batch}
+
+    # 1. 中段替换：切到原供数段中间，两侧沿用原版
+    base = [a("2026-01-01", "2026-07-01", 10)]
+    out = replace_interval(base, "2026-03-01", "2026-04-01", 20, 2)
+    check("中段替换切成三段、两侧沿用原版",
+          [(s["start_date"], s["end_date"], s["source_version_id"]) for s in out]
+          == [("2026-01-01", "2026-03-01", 10),
+              ("2026-03-01", "2026-04-01", 20),
+              ("2026-04-01", "2026-07-01", 10)],
+          str(out))
+
+    # 2. 相邻同来源段在替换后合并
+    base = [a("2026-01-01", "2026-03-01", 10), a("2026-03-01", "2026-04-01", 20, 2),
+            a("2026-04-01", "2026-07-01", 10)]
+    # 把三月切回 v10，三段同来源应合并为一段
+    out = replace_interval(base, "2026-03-01", "2026-04-01", 10, 3)
+    check("同来源相邻段合并",
+          len(out) == 1 and out[0]["start_date"] == "2026-01-01"
+          and out[0]["end_date"] == "2026-07-01"
+          and out[0]["source_version_id"] == 10, str(out))
+
+    # 3. 不相交的两次替换结果都保留（模拟并发后的累积状态）
+    base = [a("2026-01-01", "2026-07-01", 10)]
+    out = replace_interval(base, "2026-03-01", "2026-04-01", 20, 2)
+    out = replace_interval(out, "2026-05-01", "2026-06-01", 30, 3)
+    spans = {(s["start_date"], s["end_date"]): s["source_version_id"] for s in out}
+    check("两次不相交换版都纳入来源段",
+          spans.get(("2026-03-01", "2026-04-01")) == 20
+          and spans.get(("2026-05-01", "2026-06-01")) == 30
+          and spans.get(("2026-01-01", "2026-03-01")) == 10
+          and spans.get(("2026-06-01", "2026-07-01")) == 10, str(spans))
+
+    # 4. 现行视图：无来源日期标缺档；按核定版分段细化份额
+    versions = {
+        10: {"period_start": "2026-01-01", "period_end": "2026-07-01", "segments": [
+            {"start_date": "2026-01-01", "end_date": "2026-04-01",
+             "ok": True, "reason": None, "shares": {"甲": 7000, "乙": 3000}},
+            {"start_date": "2026-04-01", "end_date": "2026-07-01",
+             "ok": True, "reason": None, "shares": {"甲": 7500, "乙": 2500}},
+        ]},
+        20: {"period_start": "2026-03-01", "period_end": "2026-04-01", "segments": [
+            {"start_date": "2026-03-01", "end_date": "2026-04-01",
+             "ok": True, "reason": None, "shares": {"甲": 6000, "乙": 4000}},
+        ]},
+    }
+    assigns = [a("2026-01-01", "2026-03-01", 10), a("2026-03-01", "2026-04-01", 20, 2),
+               a("2026-04-01", "2026-07-01", 10)]
+    view = build_effective_view("2025-12-15", "2026-07-15", assigns, versions)
+    missing = [r for r in view if r["missing"]]
+    check("查询区间两端无来源标缺档",
+          [(r["start_date"], r["end_date"]) for r in missing]
+          == [("2025-12-15", "2026-01-01"), ("2026-07-01", "2026-07-15")],
+          str([(r["start_date"], r["end_date"]) for r in missing]))
+    march = next(r for r in view if r["start_date"] == "2026-03-01")
+    check("换版月份额取新核定版", march["shares"] == {"甲": 6000, "乙": 4000}
+          and march["source_version_id"] == 20)
+    # v10 自身两段份额边界（04-01）应在视图中体现
+    bounds = {r["start_date"] for r in view}
+    check("现行视图按核定版分段边界细化", "2026-04-01" in bounds, str(bounds))
+    check("非缺档段份额合计 10000",
+          all(sum(r["shares"].values()) == 10000 for r in view if not r["missing"]))
+
+    # 5. merge_adjacent 保留最早写入批号
+    merged = merge_adjacent([
+        a("2026-01-01", "2026-02-01", 10, 5),
+        a("2026-02-01", "2026-03-01", 10, 2),
+    ])
+    check("合并段保留最早写入批号", len(merged) == 1 and merged[0]["updated_batch_id"] == 2)
+
+
+# ---------------- 供数换版：Web 端到端 ----------------
+
+def test_supply_web() -> None:
+    print("== 供数换版端到端 ==")
+    tmpdir = tempfile.mkdtemp()
+    app = make_app(tmpdir)
+    client = app.test_client()
+
+    with app.app_context():
+        rid = next(r["id"] for r in db.list_recordings()
+                   if r["title"].startswith("星光渡口"))
+        versions = db.list_versions(rid)
+        v1, v2 = versions[0]["id"], versions[1]["id"]
+        # 种子已预置 B0001：上半年整段取 v1
+        seed_batch = db.latest_batch(rid)
+        check("种子预置首个供数批号", seed_batch is not None
+              and seed_batch["batch_no"] == "B0001")
+
+    # 供数中心页与录音供数页可访问
+    check("供数中心页 200", client.get("/supply").status_code == 200)
+    check("录音供数页 200",
+          client.get(f"/recordings/{rid}/supply").status_code == 200)
+
+    # 中段换版：三月切到单月核定版 v2
+    resp = form_post(client, f"/recordings/{rid}/supply",
+                     {"version_id": v2, "switch_start": "2026-03-01",
+                      "switch_end": "2026-04-01"})
+    check("换版成功 302 到批号页",
+          resp.status_code == 302 and "/supply/batches/" in resp.headers["Location"])
+    batch2_id = int(resp.headers["Location"].rstrip("/").split("/")[-1])
+
+    # 现行供数查询：三月是 v2 份额，两侧沿用 v1
+    resp = client.get(f"/api/recordings/{rid}/supply/current"
+                      "?start_date=2026-01-01&end_date=2026-07-01")
+    data = resp.get_json()
+    check("现行查询返回最新批号 B0002", data["latest_batch_no"] == "B0002")
+    by_start = {s["start_date"]: s for s in data["segments"]}
+    check("三月切到新核定版份额",
+          by_start["2026-03-01"]["shares"] == {"丁": 6000, "戊": 4000}
+          and by_start["2026-03-01"]["source_version_id"] == v2)
+    check("两侧沿用原版份额",
+          by_start["2026-01-01"]["shares"] == {"丁": 7000, "戊": 3000}
+          and by_start["2026-04-01"]["shares"] == {"丁": 7500, "戊": 2500})
+    check("现行各段均非缺档", all(not s["missing"] for s in data["segments"]))
+
+    # 超界查询：未指定来源的日期标缺档
+    resp = client.get(f"/api/recordings/{rid}/supply/current"
+                      "?start_date=2025-12-01&end_date=2026-08-01")
+    segs = resp.get_json()["segments"]
+    check("无来源日期标为缺档",
+          any(s["missing"] and s["start_date"] == "2025-12-01" for s in segs)
+          and any(s["missing"] and s["start_date"] == "2026-07-01" for s in segs))
+
+    # 旧批 B0001 复查：快照仍是换版前的单段 v1，不随后续换版改变
+    resp = client.get("/api/supply/batches/1")
+    snap = resp.get_json()["snapshot"]
+    check("旧批快照按原样保留（仍为 v1 两段）",
+          all(r["source_version_id"] == v1 for r in snap["rows"])
+          and len(snap["rows"]) == 2)
+    check("批号复查页 200",
+          client.get(f"/supply/batches/{batch2_id}").status_code == 200)
+
+    # 新批 B0002 快照包含三月 v2
+    resp = client.get(f"/api/supply/batches/{batch2_id}")
+    snap2 = resp.get_json()["snapshot"]
+    check("新批快照记录三月换版",
+          any(r["start_date"] == "2026-03-01" and r["source_version_id"] == v2
+              for r in snap2["rows"]))
+
+    # 非法：换版段超出核定版覆盖（v2 只覆盖三月）
+    with app.app_context():
+        before = len(db.list_batches(rid))
+    resp = form_post(client, f"/recordings/{rid}/supply",
+                     {"version_id": v2, "switch_start": "2026-02-01",
+                      "switch_end": "2026-04-01"})
+    check("超范围换版被拒且不产生批号", resp.status_code == 302)
+    with app.app_context():
+        check("拒绝后批号数不变", len(db.list_batches(rid)) == before)
+    with client.session_transaction() as sess:
+        flashes = [m for _, m in sess.get("_flashes", [])]
+    check("超范围提示文案", any("覆盖范围" in m for m in flashes), str(flashes))
+
+    # 非法：起日不早于止日
+    resp = form_post(client, f"/recordings/{rid}/supply",
+                     {"version_id": v1, "switch_start": "2026-05-01",
+                      "switch_end": "2026-05-01"})
+    check("起日=止日被拒", resp.status_code == 302)
+
+    # 模拟写入失败：回滚，沿用原批号 B0002 与原份额
+    resp = form_post(client, f"/recordings/{rid}/supply",
+                     {"version_id": v1, "switch_start": "2026-05-01",
+                      "switch_end": "2026-06-01", "simulate_fail": "1"})
+    check("写入失败 302", resp.status_code == 302)
+    with app.app_context():
+        check("失败后批号数不变（沿用原批号）",
+              len(db.list_batches(rid)) == before)
+        latest = db.latest_batch(rid)
+        check("失败后现行批号仍是 B0002", latest["batch_no"] == "B0002")
+    resp = client.get(f"/api/recordings/{rid}/supply/current"
+                      "?start_date=2026-01-01&end_date=2026-07-01")
+    check("失败后三月仍为 v2 份额（份额未被破坏）",
+          resp.get_json()["segments"][1]["source_version_id"] == v2)
+
+    # 查现行份额直接读物化来源段（不重放历史）：来源段数量有限且可直接列出
+    with app.app_context():
+        assigns = db.list_assignments(rid)
+        check("现行供数物化为来源段可直接查询", len(assigns) >= 1)
+
+
+def test_supply_concurrency() -> None:
+    print("== 供数换版并发（日期不相交）==")
+    tmpdir = tempfile.mkdtemp()
+    app = make_app(tmpdir)
+    with app.app_context():
+        rid = next(r["id"] for r in db.list_recordings()
+                   if r["title"].startswith("星光渡口"))
+        versions = db.list_versions(rid)
+        v1, v2 = versions[0]["id"], versions[1]["id"]
+
+    barrier = threading.Barrier(2)
+    results: dict = {}
+
+    def switch(start, end, vid, idx):
+        a = create_app({"TESTING": True,
+                        "DATABASE": app.config["DATABASE"]})
+        c = a.test_client()
+        barrier.wait()
+        r = c.post(f"/recordings/{rid}/supply",
+                   data={"version_id": vid, "switch_start": start,
+                         "switch_end": end}, follow_redirects=True)
+        results[idx] = r.status_code
+
+    t1 = threading.Thread(target=switch,
+                          args=("2026-03-01", "2026-04-01", v2, 0))
+    t2 = threading.Thread(target=switch,
+                          args=("2026-05-01", "2026-06-01", v1, 1))
+    t1.start(); t2.start(); t1.join(); t2.join()
+
+    check("两次并发换版都成功", results == {0: 200, 1: 200}, str(results))
+    with app.app_context():
+        spans = {(a["start_date"], a["end_date"]): a["source_version_id"]
+                 for a in db.list_assignments(rid)}
+        batch_count = len(db.list_batches(rid))
+    # 三月 v2 改动必须保留，证明两次不相交改动都纳入现行供数
+    check("并发后三月改动纳入现行供数",
+          spans.get(("2026-03-01", "2026-04-01")) == v2, str(spans))
+    check("并发后两侧仍为原版 v1",
+          spans.get(("2026-01-01", "2026-03-01")) == v1
+          and spans.get(("2026-04-01", "2026-07-01")) == v1)
+    check("两次换版各产生一个批号（含种子共 3 个）", batch_count == 3,
+          str(batch_count))
+
+
 if __name__ == "__main__":
     test_engine()
     test_web()
+    test_supply_engine()
+    test_supply_web()
+    test_supply_concurrency()
     print(f"\n结果：{PASS} 通过，{FAIL} 失败")
     sys.exit(1 if FAIL else 0)

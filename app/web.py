@@ -11,6 +11,7 @@ from flask import (
 
 from . import db
 from .engine import parse_iso_date, solve
+from .supply import assignment_domain, build_effective_view
 
 bp = Blueprint("web", __name__)
 
@@ -278,4 +279,280 @@ def version_api(version_id: int):
         "segments": json.loads(version["segments_json"]),
         "input_signature": version["input_signature"],
         "created_at": version["created_at"],
+    })
+
+
+# ---------- 供数换版 ----------
+
+def _load_versions_by_id(version_ids) -> dict[int, sqlite3.Row]:
+    versions = {}
+    for vid in {v for v in version_ids if v is not None}:
+        row = db.get_version(vid)
+        if row is not None:
+            versions[vid] = row
+    return versions
+
+
+def _version_label(version: sqlite3.Row | None) -> str:
+    if version is None:
+        return "未知核定版"
+    return (f"核定版 v{version['version_no']}"
+            f"（{version['period_start']} ~ {version['period_end']}）")
+
+
+def _effective_rows(query_start: str, query_end: str, assignments,
+                    versions_by_id: dict) -> list[dict]:
+    """把来源段 + 核定版分段转成查询结果行（含缺档行）。"""
+    plain_assignments = [
+        {
+            "start_date": a["start_date"],
+            "end_date": a["end_date"],
+            "source_version_id": a["source_version_id"],
+            "updated_batch_id": a["updated_batch_id"],
+        }
+        for a in assignments
+    ]
+    plain_versions = {
+        vid: {
+            "period_start": v["period_start"],
+            "period_end": v["period_end"],
+            "segments": json.loads(v["segments_json"]),
+        }
+        for vid, v in versions_by_id.items()
+    }
+    return build_effective_view(
+        query_start, query_end, plain_assignments, plain_versions
+    )
+
+
+def _current_snapshot_builder(recording_id: int):
+    """生成 perform_switch 所需的快照回调：换版瞬间的完整供数结果。
+
+    回调在写事务内执行，版本数据通过 txn_get_version 从同一事务连接读取，
+    保证快照与本次换版后的来源段处于同一数据库视图。
+    """
+    def build(new_assignments, txn_get_version):
+        version_ids = [a["source_version_id"] for a in new_assignments]
+        versions_by_id = {vid: txn_get_version(vid) for vid in set(version_ids)}
+        domain = assignment_domain(new_assignments)
+        if domain is None:
+            rows = []
+        else:
+            rows = _effective_rows(
+                domain[0], domain[1], new_assignments, versions_by_id,
+            )
+        return {
+            "domain": list(domain) if domain else None,
+            "assignments": new_assignments,
+            "rows": rows,
+        }
+    return build
+
+
+@bp.route("/supply")
+def supply_index():
+    recordings = db.list_recordings()
+    latest = {r["id"]: db.latest_batch(r["id"]) for r in recordings}
+    return render_template(
+        "supply_index.html", recordings=recordings, latest=latest,
+    )
+
+
+@bp.route("/recordings/<int:recording_id>/supply", methods=["GET", "POST"])
+def supply_switch(recording_id: int):
+    recording = _load_recording_or_404(recording_id)
+    versions = db.list_versions(recording_id)
+    assignments = db.list_assignments(recording_id)
+    batches = db.list_batches(recording_id)
+    versions_by_id = _load_versions_by_id(
+        [a["source_version_id"] for a in assignments]
+        + [v["id"] for v in versions]
+    )
+
+    if request.method == "POST":
+        version = db.get_version(int(request.form.get("version_id", 0) or 0))
+        if version is None or version["recording_id"] != recording_id:
+            flash("请选择该录音已发布的核定版作为换版来源", "error")
+            return redirect(url_for("web.supply_switch", recording_id=recording_id))
+
+        period = _validate_period(
+            request.form.get("switch_start", ""),
+            request.form.get("switch_end", ""),
+        )
+        if period[0] is None:
+            flash(period[1], "error")
+            return redirect(url_for("web.supply_switch", recording_id=recording_id))
+        switch_start, switch_end = period
+
+        if not (version["period_start"] <= switch_start
+                and switch_end <= version["period_end"]):
+            flash(
+                "换版日期段必须完全落在该核定版覆盖范围内（含起日、不含止日）："
+                f"{version['period_start']} ~ {version['period_end']}",
+                "error",
+            )
+            return redirect(url_for("web.supply_switch", recording_id=recording_id))
+
+        fail = request.form.get("simulate_fail") == "1"
+        try:
+            outcome = db.perform_switch(
+                recording_id, version, switch_start, switch_end,
+                _current_snapshot_builder(recording_id), fail=fail,
+            )
+        except sqlite3.Error as exc:
+            flash(
+                f"换版写入失败（{exc}），本次改动已回滚；"
+                "继续使用原批号与原份额",
+                "error",
+            )
+            return redirect(url_for("web.supply_switch", recording_id=recording_id))
+
+        flash(
+            f"换版成功，供数批号 {outcome['batch_no']}："
+            f"{switch_start}（含）~ {switch_end}（不含）来源切至"
+            + _version_label(version),
+            "ok",
+        )
+        return redirect(
+            url_for("web.supply_batch_show", batch_id=outcome["batch_id"])
+        )
+
+    # GET：默认展示现行供数（有来源段时按外包区间，否则给空表）
+    current_rows: list[dict] = []
+    domain = None
+    if assignments:
+        domain = (
+            min(a["start_date"] for a in assignments),
+            max(a["end_date"] for a in assignments),
+        )
+        current_rows = _effective_rows(
+            domain[0], domain[1], assignments, versions_by_id
+        )
+    return render_template(
+        "supply_switch.html",
+        recording=recording,
+        versions=versions,
+        assignments=assignments,
+        batches=batches,
+        versions_by_id=versions_by_id,
+        version_label=_version_label,
+        current_rows=current_rows,
+        domain=domain,
+    )
+
+
+@bp.route("/recordings/<int:recording_id>/supply/current", methods=["GET", "POST"])
+def supply_current(recording_id: int):
+    recording = _load_recording_or_404(recording_id)
+    assignments = db.list_assignments(recording_id)
+    versions = db.list_versions(recording_id)
+    versions_by_id = _load_versions_by_id(
+        [a["source_version_id"] for a in assignments]
+        + [v["id"] for v in versions]
+    )
+
+    start_raw = request.values.get("start_date", "")
+    end_raw = request.values.get("end_date", "")
+    rows: list[dict] = []
+    queried = False
+    period_error = None
+    if start_raw or end_raw:
+        queried = True
+        period = _validate_period(start_raw, end_raw)
+        if period[0] is None:
+            period_error = period[1]
+        else:
+            start, end = period
+            rows = _effective_rows(start, end, assignments, versions_by_id)
+
+    latest = db.latest_batch(recording_id)
+    return render_template(
+        "supply_current.html",
+        recording=recording,
+        rows=rows,
+        queried=queried,
+        period_error=period_error,
+        start_raw=start_raw,
+        end_raw=end_raw,
+        latest=latest,
+        versions_by_id=versions_by_id,
+        version_label=_version_label,
+    )
+
+
+@bp.route("/supply/batches/<int:batch_id>")
+def supply_batch_show(batch_id: int):
+    batch = db.get_batch(batch_id)
+    if batch is None:
+        abort(404)
+    recording = _load_recording_or_404(batch["recording_id"])
+    snapshot = json.loads(batch["result_json"])
+    target = db.get_version(batch["target_version_id"])
+    versions_by_id = _load_versions_by_id(
+        [r.get("source_version_id") for r in snapshot["rows"]]
+        + [batch["target_version_id"]]
+    )
+    return render_template(
+        "supply_batch.html",
+        batch=batch,
+        recording=recording,
+        snapshot=snapshot,
+        target=target,
+        versions_by_id=versions_by_id,
+        version_label=_version_label,
+    )
+
+
+@bp.route("/api/recordings/<int:recording_id>/supply/current")
+def supply_current_api(recording_id: int):
+    if db.get_recording(recording_id) is None:
+        abort(404)
+    period = _validate_period(
+        request.args.get("start_date", ""), request.args.get("end_date", "")
+    )
+    if period[0] is None:
+        return jsonify({"error": period[1]}), 400
+    start, end = period
+    assignments = db.list_assignments(recording_id)
+    versions_by_id = _load_versions_by_id(
+        [a["source_version_id"] for a in assignments]
+    )
+    rows = _effective_rows(start, end, assignments, versions_by_id)
+    latest = db.latest_batch(recording_id)
+    return jsonify({
+        "recording_id": recording_id,
+        "query": [start, end],
+        "latest_batch_no": latest["batch_no"] if latest else None,
+        "segments": [
+            {
+                "start_date": r["start_date"],
+                "end_date": r["end_date"],
+                "shares": r["shares"],
+                "source_version_id": r["source_version_id"],
+                "source": _version_label(versions_by_id.get(r["source_version_id"]))
+                if r["source_version_id"] else None,
+                "missing": r["missing"],
+                "reason": r["reason"],
+            }
+            for r in rows
+        ],
+    })
+
+
+@bp.route("/api/supply/batches/<int:batch_id>")
+def supply_batch_api(batch_id: int):
+    batch = db.get_batch(batch_id)
+    if batch is None:
+        abort(404)
+    snapshot = json.loads(batch["result_json"])
+    return jsonify({
+        "batch_id": batch["id"],
+        "batch_no": batch["batch_no"],
+        "recording_id": batch["recording_id"],
+        "switch": {
+            "period": [batch["period_start"], batch["period_end"]],
+            "target_version_id": batch["target_version_id"],
+        },
+        "created_at": batch["created_at"],
+        "snapshot": snapshot,
     })

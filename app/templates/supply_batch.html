@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}供数批号 {{ batch.batch_no }}{% endblock %}
+{% block content %}
+<p><a href="{{ url_for('web.supply_switch', recording_id=recording.id) }}">&larr; 返回 {{ recording.title }} 供数换版</a></p>
+<h2>供数批号复查 · {{ batch.batch_no }}</h2>
+<div class="flash ok">本页为该批号生成瞬间的完整结果快照；后续换版不改变本批数据，旧批始终按原样取数。</div>
+<table class="meta">
+  <tr><th>录音</th><td>{{ recording.title }}</td></tr>
+  <tr><th>批号</th><td><strong>{{ batch.batch_no }}</strong></td></tr>
+  <tr><th>本次换版段</th><td>{{ batch.switch_start }}（含） ~ {{ batch.switch_end }}（不含）</td></tr>
+  <tr><th>切至核定版</th><td>{{ version_label(target) }}</td></tr>
+  <tr><th>生成时间</th><td>{{ batch.created_at }}</td></tr>
+  <tr><th>快照外包区间</th><td>{{ snapshot.domain[0] if snapshot.domain else '—' }}
+      ~ {{ snapshot.domain[1] if snapshot.domain else '—' }}</td></tr>
+</table>
+
+<h3>当时的完整供数结果（逐段份额与来源，缺档照实标出）</h3>
+<table>
+  <thead>
+    <tr><th>段起日(含)</th><th>段止日(不含)</th><th>份额（万分比）</th><th>来源核定版</th><th>状态</th></tr>
+  </thead>
+  <tbody>
+  {% for r in snapshot.rows %}
+    <tr>
+      <td>{{ r.start_date }}</td><td>{{ r.end_date }}</td>
+      <td>{% for name, value in r.shares.items() %}<span class="chip">{{ name }}：{{ value }}</span>{% endfor %}</td>
+      <td>{% if r.source_version_id %}{{ version_label(versions_by_id.get(r.source_version_id)) }}{% else %}—{% endif %}</td>
+      <td>{% if r.missing %}<span class="bad">缺档</span>
+        <div class="muted">{{ r.reason }}</div>{% else %}<span class="ok">可供数</span>{% endif %}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="5" class="muted">该批无来源段。</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p><a class="button" href="{{ url_for('web.supply_batch_api', batch_id=batch.id) }}">查看批号 JSON</a></p>
+{% endblock %}
